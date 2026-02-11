@@ -1,0 +1,8 @@
+# Build output
+build/
+
+# Model files
+*.bin
+
+# macOS metadata
+.DS_Store
