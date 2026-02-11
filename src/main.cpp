@@ -8,12 +8,14 @@
 #include "ggml-backend.h"
 #include "httplib.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -55,6 +57,14 @@ static const char * const INDEX_HTML = R"html(<!DOCTYPE html>
             text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
             word-wrap: break-word;
         }
+        #original {
+            font-size: 1.2rem;
+            line-height: 1.4;
+            margin-top: 0.5rem;
+            opacity: 0.5;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.8);
+            word-wrap: break-word;
+        }
         #language-badge {
             display: inline-block;
             padding: 0.2rem 0.6rem;
@@ -71,6 +81,21 @@ static const char * const INDEX_HTML = R"html(<!DOCTYPE html>
             font-size: 0.8rem;
             opacity: 0.5;
         }
+        #lang-select {
+            position: fixed;
+            top: 1rem;
+            left: 1rem;
+            background: rgba(255,255,255,0.15);
+            color: #fff;
+            border: 1px solid rgba(255,255,255,0.3);
+            border-radius: 6px;
+            padding: 0.4rem 0.6rem;
+            font-size: 0.85rem;
+            cursor: pointer;
+            outline: none;
+            display: none;
+        }
+        #lang-select option { background: #222; color: #fff; }
         .connected { color: #4ade80; }
         .disconnected { color: #f87171; }
         .fade { opacity: 0.3; }
@@ -78,16 +103,66 @@ static const char * const INDEX_HTML = R"html(<!DOCTYPE html>
 </head>
 <body>
     <div id="status" class="disconnected">&#9679; Disconnected</div>
+    <select id="lang-select"><option value="">Loading...</option></select>
     <div id="subtitle-container">
         <div id="language-badge"></div>
         <div id="subtitle"></div>
+        <div id="original"></div>
     </div>
     <script>
         const subtitle = document.getElementById('subtitle');
+        const original = document.getElementById('original');
         const langBadge = document.getElementById('language-badge');
         const container = document.getElementById('subtitle-container');
         const status = document.getElementById('status');
+        const langSelect = document.getElementById('lang-select');
         let fadeTimer = null;
+        let translateEnabled = false;
+
+        function clearSelectOptions(select) {
+            while (select.firstChild) select.removeChild(select.firstChild);
+        }
+
+        function addOption(select, value, text) {
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = text;
+            select.appendChild(opt);
+        }
+
+        async function loadConfig() {
+            try {
+                const res = await fetch('/api/config');
+                const cfg = await res.json();
+                translateEnabled = cfg.translate_enabled;
+                if (!translateEnabled) return;
+
+                langSelect.style.display = 'block';
+
+                const langRes = await fetch('/api/languages');
+                const languages = await langRes.json();
+                if (!languages.length) { langSelect.style.display = 'none'; return; }
+
+                clearSelectOptions(langSelect);
+                addOption(langSelect, '', 'Translate off');
+                for (const lang of languages) {
+                    addOption(langSelect, lang.code, lang.name);
+                }
+                langSelect.value = cfg.target_lang || '';
+            } catch (e) {
+                langSelect.style.display = 'none';
+            }
+        }
+
+        langSelect.addEventListener('change', async () => {
+            try {
+                await fetch('/api/config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({target_lang: langSelect.value})
+                });
+            } catch (e) { /* ignore */ }
+        });
 
         function connect() {
             const es = new EventSource('/events');
@@ -101,7 +176,13 @@ static const char * const INDEX_HTML = R"html(<!DOCTYPE html>
                 try {
                     const data = JSON.parse(event.data);
                     if (data.text) {
-                        subtitle.textContent = data.text;
+                        if (data.translated) {
+                            subtitle.textContent = data.translated;
+                            original.textContent = data.text;
+                        } else {
+                            subtitle.textContent = data.text;
+                            original.textContent = '';
+                        }
                         container.classList.remove('fade');
 
                         if (data.language) {
@@ -124,6 +205,7 @@ static const char * const INDEX_HTML = R"html(<!DOCTYPE html>
             };
         }
 
+        loadConfig();
         connect();
     </script>
 </body>
@@ -156,6 +238,56 @@ static std::string escape_json(const std::string & s) {
     return out;
 }
 
+// Build a JSON string field: "key":"escaped_value"
+static std::string json_str(const char * key, const std::string & value) {
+    return std::string("\"") + key + "\":\"" + escape_json(value) + "\"";
+}
+
+// Build a JSON bool field: "key":true/false
+static std::string json_bool(const char * key, bool value) {
+    return std::string("\"") + key + "\":" + (value ? "true" : "false");
+}
+
+// ---------------------------------------------------------------------------
+// Translation via LibreTranslate
+// ---------------------------------------------------------------------------
+
+static std::string translate_text(httplib::Client & client,
+                                  const std::string & text,
+                                  const std::string & source_lang,
+                                  const std::string & target_lang) {
+    std::string body = "{" + json_str("q", text) +
+                       "," + json_str("source", source_lang) +
+                       "," + json_str("target", target_lang) + "}";
+
+    auto res = client.Post("/translate", body, "application/json");
+    if (!res || res->status != 200) {
+        return "";
+    }
+
+    // Minimal JSON extraction for {"translatedText":"..."}
+    // Handles \" and \\ escapes (sufficient for LibreTranslate responses)
+    const std::string needle = "\"translatedText\":\"";
+    auto pos = res->body.find(needle);
+    if (pos == std::string::npos) {
+        return "";
+    }
+    pos += needle.size();
+
+    std::string result;
+    for (size_t i = pos; i < res->body.size(); i++) {
+        if (res->body[i] == '\\' && i + 1 < res->body.size()) {
+            result += res->body[i + 1];
+            i++;
+        } else if (res->body[i] == '"') {
+            break;
+        } else {
+            result += res->body[i];
+        }
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // Shared state between main loop and SSE clients
 // ---------------------------------------------------------------------------
@@ -164,7 +296,9 @@ struct subtitle_state {
     std::mutex              mtx;
     std::condition_variable cv;
     std::string             text;
+    std::string             translated;
     std::string             language;
+    std::string             target_lang;
     uint64_t                version = 0;
     bool                    running = true;
 };
@@ -186,8 +320,9 @@ struct params {
     bool use_gpu   = true;
     bool flash_attn = true;
 
-    std::string language = "auto";
-    std::string model    = "models/ggml-large-v3-turbo.bin";
+    std::string language      = "auto";
+    std::string model         = "models/ggml-large-v3-turbo.bin";
+    std::string translate_url;
 };
 
 static void print_usage(const char * prog) {
@@ -203,6 +338,7 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  --capture N        Audio device ID         (default: -1 = auto)\n");
     fprintf(stderr, "  --language LANG    Language or 'auto'      (default: auto)\n");
     fprintf(stderr, "  --vad-thold F      VAD energy threshold    (default: 0.6)\n");
+    fprintf(stderr, "  --translate-url URL LibreTranslate server   (default: disabled)\n");
     fprintf(stderr, "  --no-gpu           Disable GPU\n");
     fprintf(stderr, "  --no-flash-attn    Disable flash attention\n");
     fprintf(stderr, "  -h, --help         Show this help\n\n");
@@ -220,6 +356,7 @@ static bool parse_params(int argc, char ** argv, params & p) {
         else if (arg == "--capture"   && i+1 < argc) { p.capture_id = std::stoi(argv[++i]); }
         else if (arg == "--language"  && i+1 < argc) { p.language   = argv[++i]; }
         else if (arg == "--vad-thold" && i+1 < argc) { p.vad_thold  = std::stof(argv[++i]); }
+        else if (arg == "--translate-url" && i+1 < argc) { p.translate_url = argv[++i]; }
         else if (arg == "--no-gpu")         { p.use_gpu    = false; }
         else if (arg == "--no-flash-attn")  { p.flash_attn = false; }
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return false; }
@@ -329,8 +466,9 @@ int main(int argc, char ** argv) {
 
                 if (state.version > client_version) {
                     client_version = state.version;
-                    std::string json = "{\"text\":\"" + escape_json(state.text) +
-                                       "\",\"language\":\"" + state.language + "\"}";
+                    std::string json = "{" + json_str("text", state.text) +
+                                       "," + json_str("translated", state.translated) +
+                                       "," + json_str("language", state.language) + "}";
                     std::string event = "data: " + json + "\n\n";
                     if (!sink.write(event.c_str(), event.size())) {
                         return false;
@@ -346,6 +484,52 @@ int main(int argc, char ** argv) {
         );
     });
 
+    // ── Translation API endpoints ───────────────────────────────────────
+
+    svr.Get("/api/languages", [&par](const httplib::Request &, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (par.translate_url.empty()) {
+            res.set_content("[]", "application/json");
+            return;
+        }
+        httplib::Client client(par.translate_url);
+        client.set_connection_timeout(2);
+        client.set_read_timeout(3);
+        auto r = client.Get("/languages");
+        if (r && r->status == 200) {
+            res.set_content(r->body, "application/json");
+        } else {
+            res.set_content("[]", "application/json");
+        }
+    });
+
+    svr.Get("/api/config", [&state, &par](const httplib::Request &, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::lock_guard<std::mutex> lock(state.mtx);
+        std::string json = "{" + json_str("target_lang", state.target_lang) +
+                           "," + json_bool("translate_enabled", !par.translate_url.empty()) + "}";
+        res.set_content(json, "application/json");
+    });
+
+    svr.Post("/api/config", [&state](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        const std::string needle = "\"target_lang\":\"";
+        auto pos = req.body.find(needle);
+        std::string lang;
+        if (pos != std::string::npos) {
+            pos += needle.size();
+            auto end = req.body.find('"', pos);
+            if (end != std::string::npos) {
+                lang = req.body.substr(pos, end - pos);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            state.target_lang = lang;
+        }
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+
     std::thread server_thread([&svr, &par]() {
         fprintf(stderr, "listening on http://localhost:%d\n\n", par.port);
         svr.listen("0.0.0.0", par.port);
@@ -359,6 +543,19 @@ int main(int argc, char ** argv) {
 
     std::string prev_text;
     int         repeat_count = 0;
+
+    // Translation client (created only if --translate-url is set)
+    std::unique_ptr<httplib::Client> translate_client;
+    if (!par.translate_url.empty()) {
+        translate_client = std::make_unique<httplib::Client>(par.translate_url);
+        translate_client->set_connection_timeout(2);
+        translate_client->set_read_timeout(3);
+        fprintf(stderr, "translation: %s\n\n", par.translate_url.c_str());
+    }
+
+    // 1-entry translation cache
+    std::string cache_key;
+    std::string cache_result;
 
     while (g_running) {
         // Collect step_ms worth of audio samples
@@ -389,14 +586,15 @@ int main(int argc, char ** argv) {
 
         const int n_samples_new = (int)pcmf32_new.size();
 
-        // Energy check — skip silent audio to prevent hallucination
+        // Energy-based VAD — skip silent audio to prevent hallucination
         {
+            constexpr float silence_threshold = 0.0001f;
             float energy = 0.0f;
             for (float sample : pcmf32_new) {
                 energy += fabsf(sample);
             }
             energy /= n_samples_new;
-            if (energy < 0.0001f) {
+            if (energy < silence_threshold) {
                 continue;
             }
         }
@@ -412,9 +610,8 @@ int main(int argc, char ** argv) {
                 pcmf32[i] = pcmf32_old[(int)pcmf32_old.size() - n_samples_take + i];
             }
         }
-        memcpy(pcmf32.data() + n_samples_take,
-               pcmf32_new.data(),
-               n_samples_new * sizeof(float));
+        std::copy(pcmf32_new.begin(), pcmf32_new.end(),
+                 pcmf32.begin() + n_samples_take);
 
         pcmf32_old = pcmf32;
 
@@ -462,17 +659,50 @@ int main(int argc, char ** argv) {
         const int lang_id = whisper_full_lang_id(ctx);
         const std::string lang = (lang_id >= 0) ? whisper_lang_str(lang_id) : "??";
 
+        // ── Translation (outside mutex) ──────────────────────────────────
+
+        std::string translated;
+        std::string target_lang;
+
+        if (translate_client) {
+            {
+                std::lock_guard<std::mutex> lock(state.mtx);
+                target_lang = state.target_lang;
+            }
+
+            if (!target_lang.empty() && target_lang != lang) {
+                // Tab separator avoids collision with text/lang content
+                std::string cache_check = text + "\t" + target_lang;
+                if (cache_check == cache_key) {
+                    translated = cache_result;
+                } else {
+                    translated = translate_text(*translate_client, text, lang, target_lang);
+                    cache_key = cache_check;
+                    cache_result = translated;
+                    if (translated.empty()) {
+                        fprintf(stderr, "warning: translation failed\n");
+                    }
+                }
+            }
+        }
+
         // ── Update shared state → notify SSE clients ─────────────────────
 
         {
             std::lock_guard<std::mutex> lock(state.mtx);
-            state.text     = text;
-            state.language = lang;
+            state.text       = text;
+            state.translated = translated;
+            state.language   = lang;
             state.version++;
         }
         state.cv.notify_all();
 
-        fprintf(stderr, "[%s] %s\n", lang.c_str(), text.c_str());
+        if (!translated.empty()) {
+            fprintf(stderr, "[%s->%s] %s -> %s\n", lang.c_str(), target_lang.c_str(),
+                    text.c_str(), translated.c_str());
+        } else {
+            fprintf(stderr, "[%s] %s\n", lang.c_str(), text.c_str());
+        }
     }
 
     // ── Graceful shutdown ────────────────────────────────────────────────
