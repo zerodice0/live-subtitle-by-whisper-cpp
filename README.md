@@ -76,19 +76,27 @@ make -j$(sysctl -n hw.ncpu)
 
 실행 후 브라우저에서 `http://localhost:8080`을 열면 실시간 자막이 표시됩니다.
 
+- 기본 화면은 OBS 크로마키용 초록 배경(`#00FF00`) + 자막만 표시합니다.
+- 설정 화면은 `http://localhost:8080/?settings=1`에서 확인할 수 있습니다.
+
 ### 명령줄 옵션
 
 ```
 옵션                    설명                          기본값
 --model PATH           Whisper 모델 파일 경로         models/ggml-large-v3-turbo.bin
 --port N               HTTP 서버 포트                 8080
---language LANG        인식 언어 (ko, en, ja 등)      auto (자동 감지)
---step N               오디오 처리 간격 (ms)           3000
---length N             오디오 버퍼 길이 (ms)           10000
+--language LANG        인식 언어 (ko, en, ja 등)      ko
+--step N               오디오 처리 간격 (ms)           1000
+--length N             오디오 버퍼 길이 (ms)           4000
 --keep N               이전 오디오 유지 길이 (ms)       200
 --threads N            추론 스레드 수                  4
 --capture N            오디오 장치 ID                  -1 (기본 장치)
---vad-thold F          음성 감지 에너지 임계값          0.6
+--capture-name STR     오디오 장치 이름으로 선택         (부분 일치 지원)
+--vad-thold F          음성 감지 에너지 임계값          0.0~1.0 (기본 0.6)
+--beam-size N          Beam Search 크기               1~8 (1=Greedy)
+--max-tokens N         세그먼트 최대 토큰 수            32 (0=제한 없음)
+--temperature-inc F    온도 fallback 증가값             0.0 (비활성)
+--no-vad               VAD 게이트 비활성화
 --no-gpu               GPU 비활성화
 --no-flash-attn        Flash Attention 비활성화
 -h, --help             도움말 표시
@@ -110,6 +118,14 @@ make -j$(sysctl -n hw.ncpu)
 ./build/bin/live-subtitle \
   --model /path/to/models/ggml-large-v3-turbo.bin \
   --capture 2
+```
+
+장치 이름으로 고정 선택 (장치 순서가 바뀌어도 안정적):
+
+```bash
+./build/bin/live-subtitle \
+  --model /path/to/models/ggml-large-v3-turbo.bin \
+  --capture-name "Scarlett Solo USB"
 ```
 
 다른 포트에서 실행:
@@ -139,9 +155,29 @@ make -j$(sysctl -n hw.ncpu)
 
 ### 설정 API (`/api/config`)
 
-- `POST /api/config` 요청 본문은 JSON 형식이며 `"target_lang"` 문자열 필드가 필요합니다.
-- 유효한 예시: `{"target_lang":"en"}` 또는 `{"target_lang":""}` (번역 끄기)
-- 잘못된 JSON(예: trailing garbage 포함) 또는 `"target_lang"` 누락/타입 오류는 `400`과 `{"ok":false,"error":"invalid target_lang"}`를 반환합니다.
+- `GET /api/config` 응답:
+  - `source_lang` (문자열): 현재 소스 인식 언어 (`"ko"`, `"en"`, `"auto"` 등)
+  - `target_lang` (문자열): 번역 대상 언어 (`""`이면 번역 끔)
+  - `translate_enabled` (불리언): 번역 서버 사용 가능 여부
+- `POST /api/config` 요청 본문은 JSON 오브젝트이며 `source_lang`/`target_lang` 중 하나 이상을 포함해야 합니다.
+- 유효한 예시:
+  - `{"source_lang":"ko"}`
+  - `{"source_lang":"auto"}`
+  - `{"target_lang":"en"}`
+  - `{"source_lang":"ko","target_lang":""}`
+- 검증 규칙:
+  - `source_lang`은 `"auto"` 또는 Whisper가 지원하는 언어 코드여야 합니다.
+  - `source_lang`/`target_lang`은 문자열 타입이어야 합니다.
+- 오류 응답:
+  - JSON 파싱 실패, 필드 누락/타입 오류: `400`, `{"ok":false,"error":"invalid config"}`
+  - `source_lang` 코드 오류: `400`, `{"ok":false,"error":"invalid source_lang"}`
+
+### 소스 언어 목록 API (`/api/source-languages`)
+
+- `GET /api/source-languages`는 소스 인식 언어 목록을 반환합니다.
+- 응답 형식:
+  - `[{"code":"auto","name":"Auto"},{"code":"ko","name":"Korean"}, ...]`
+- 단일 언어 모델(비 multilingual)에서는 `auto`와 `en`만 노출됩니다.
 
 ## 프로젝트 구조
 
@@ -162,6 +198,6 @@ live-subtitle/
 1. SDL2로 마이크에서 오디오를 실시간 캡처
 2. 설정된 간격(`--step`)마다 오디오 데이터를 whisper.cpp에 전달
 3. VAD로 무음 구간은 건너뜀 (`--step`이 1초 미만이면 에너지 체크로 대체)
-4. 동일 텍스트 3회 이상 반복 시 출력 생략 (환각 방지)
+4. 반복 패턴(토큰 비율/연속 반복/suffix 반복 확장)이 강하게 감지되면 출력 생략 (환각 방지)
 5. 인식 결과를 SSE(Server-Sent Events)로 연결된 브라우저에 실시간 전송
 6. 브라우저에서 자막 스타일로 텍스트 표시, 5초간 입력 없으면 페이드 처리

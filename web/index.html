@@ -7,7 +7,7 @@
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            background: #000;
+            background: #00ff00;
             color: #fff;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
             height: 100vh;
@@ -20,49 +20,211 @@
         }
         #subtitle-container {
             text-align: center;
-            max-width: 90%;
-            transition: opacity 0.5s ease;
+            max-width: 92%;
+            transition: opacity 0.35s ease;
         }
         #subtitle {
-            font-size: 2.5rem;
-            font-weight: 600;
-            line-height: 1.4;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+            font-size: 2.7rem;
+            font-weight: 700;
+            line-height: 1.35;
             word-wrap: break-word;
+            white-space: pre-wrap;
+            text-shadow:
+                -2px -2px 0 rgba(0, 0, 0, 0.95),
+                 2px -2px 0 rgba(0, 0, 0, 0.95),
+                -2px  2px 0 rgba(0, 0, 0, 0.95),
+                 2px  2px 0 rgba(0, 0, 0, 0.95),
+                 0    0   8px rgba(0, 0, 0, 0.9);
+        }
+        #original {
+            display: none;
+            margin-top: 0.45rem;
+            font-size: 1.1rem;
+            line-height: 1.35;
+            opacity: 0.82;
+            word-wrap: break-word;
+            text-shadow: 0 0 6px rgba(0, 0, 0, 0.9);
+        }
+        #original.show-original {
+            display: block;
         }
         #language-badge {
-            display: inline-block;
-            padding: 0.2rem 0.6rem;
-            margin-bottom: 0.5rem;
-            border-radius: 4px;
-            font-size: 0.8rem;
-            background: rgba(255,255,255,0.2);
-            opacity: 0.7;
+            display: none;
+            margin-bottom: 0.55rem;
+            padding: 0.2rem 0.55rem;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            background: rgba(0, 0, 0, 0.55);
+            border: 1px solid rgba(255, 255, 255, 0.35);
         }
         #status {
+            display: none;
             position: fixed;
             top: 1rem;
             right: 1rem;
-            font-size: 0.8rem;
-            opacity: 0.5;
+            font-size: 0.82rem;
+            text-shadow: 0 0 6px rgba(0, 0, 0, 0.9);
         }
+        #settings-panel {
+            display: none;
+            position: fixed;
+            top: 1rem;
+            left: 1rem;
+            min-width: 235px;
+            padding: 0.75rem;
+            border-radius: 9px;
+            background: rgba(0, 0, 0, 0.55);
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            backdrop-filter: blur(4px);
+            gap: 0.6rem;
+            flex-direction: column;
+        }
+        .settings-row {
+            display: flex;
+            flex-direction: column;
+            gap: 0.22rem;
+        }
+        .settings-row label {
+            font-size: 0.78rem;
+            opacity: 0.9;
+        }
+        .settings-row select {
+            background: rgba(20, 20, 20, 0.8);
+            color: #fff;
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            border-radius: 6px;
+            padding: 0.4rem 0.48rem;
+            font-size: 0.86rem;
+            outline: none;
+        }
+        .settings-row select option {
+            background: #111;
+            color: #fff;
+        }
+        body.settings-mode #status { display: block; }
+        body.settings-mode #settings-panel { display: flex; }
+        body.settings-mode #language-badge { display: inline-block; }
         .connected { color: #4ade80; }
         .disconnected { color: #f87171; }
-        .fade { opacity: 0.3; }
+        .fade { opacity: 0.26; }
+        @media (max-width: 920px) {
+            body { padding: 1rem; }
+            #subtitle { font-size: 1.95rem; }
+            #settings-panel { min-width: 190px; padding: 0.55rem; }
+        }
     </style>
 </head>
 <body>
     <div id="status" class="disconnected">&#9679; Disconnected</div>
+    <div id="settings-panel">
+        <div class="settings-row">
+            <label for="source-lang-select">Source language</label>
+            <select id="source-lang-select"><option value="ko">Loading...</option></select>
+        </div>
+        <div class="settings-row" id="target-lang-row">
+            <label for="target-lang-select">Translate to</label>
+            <select id="target-lang-select"><option value="">Translate off</option></select>
+        </div>
+    </div>
     <div id="subtitle-container">
         <div id="language-badge"></div>
         <div id="subtitle"></div>
+        <div id="original"></div>
     </div>
     <script>
         const subtitle = document.getElementById('subtitle');
+        const original = document.getElementById('original');
         const langBadge = document.getElementById('language-badge');
         const container = document.getElementById('subtitle-container');
         const status = document.getElementById('status');
+        const sourceLangSelect = document.getElementById('source-lang-select');
+        const targetLangSelect = document.getElementById('target-lang-select');
+        const targetLangRow = document.getElementById('target-lang-row');
+        const settingsMode = new URLSearchParams(window.location.search).get('settings') === '1';
+        if (settingsMode) {
+            document.body.classList.add('settings-mode');
+        }
         let fadeTimer = null;
+        let translateEnabled = false;
+
+        function clearSelectOptions(select) {
+            while (select.firstChild) select.removeChild(select.firstChild);
+        }
+
+        function addOption(select, value, text) {
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = text;
+            select.appendChild(opt);
+        }
+
+        async function postConfig(patch) {
+            await fetch('/api/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(patch)
+            });
+        }
+
+        async function loadSourceLanguages(selected) {
+            const res = await fetch('/api/source-languages');
+            const languages = await res.json();
+            clearSelectOptions(sourceLangSelect);
+            if (!Array.isArray(languages) || !languages.length) {
+                addOption(sourceLangSelect, 'ko', 'Korean');
+            } else {
+                for (const lang of languages) {
+                    addOption(sourceLangSelect, lang.code, lang.name);
+                }
+            }
+            sourceLangSelect.value = selected || sourceLangSelect.value || 'ko';
+        }
+
+        async function loadTargetLanguages(selected) {
+            if (!translateEnabled) {
+                targetLangRow.style.display = 'none';
+                return;
+            }
+
+            targetLangRow.style.display = 'flex';
+            const langRes = await fetch('/api/languages');
+            const languages = await langRes.json();
+
+            clearSelectOptions(targetLangSelect);
+            addOption(targetLangSelect, '', 'Translate off');
+            if (Array.isArray(languages)) {
+                for (const lang of languages) {
+                    addOption(targetLangSelect, lang.code, lang.name);
+                }
+            }
+            targetLangSelect.value = selected || '';
+        }
+
+        async function loadSettings() {
+            if (!settingsMode) return;
+
+            try {
+                const res = await fetch('/api/config');
+                const cfg = await res.json();
+                translateEnabled = !!cfg.translate_enabled;
+                await loadSourceLanguages(cfg.source_lang || 'ko');
+                await loadTargetLanguages(cfg.target_lang || '');
+            } catch (e) {
+                targetLangRow.style.display = 'none';
+            }
+        }
+
+        sourceLangSelect.addEventListener('change', async () => {
+            try {
+                await postConfig({source_lang: sourceLangSelect.value});
+            } catch (e) { /* ignore */ }
+        });
+
+        targetLangSelect.addEventListener('change', async () => {
+            try {
+                await postConfig({target_lang: targetLangSelect.value});
+            } catch (e) { /* ignore */ }
+        });
 
         function connect() {
             const es = new EventSource('/events');
@@ -76,13 +238,23 @@
                 try {
                     const data = JSON.parse(event.data);
                     if (data.text) {
-                        subtitle.textContent = data.text;
-                        container.classList.remove('fade');
+                        if (data.translated) {
+                            subtitle.textContent = data.translated;
+                            original.textContent = data.text || '';
+                            if (settingsMode && original.textContent) {
+                                original.classList.add('show-original');
+                            }
+                        } else {
+                            subtitle.textContent = data.text;
+                            original.textContent = '';
+                            original.classList.remove('show-original');
+                        }
 
                         if (data.language) {
                             langBadge.textContent = data.language.toUpperCase();
                         }
 
+                        container.classList.remove('fade');
                         if (fadeTimer) clearTimeout(fadeTimer);
                         fadeTimer = setTimeout(() => {
                             container.classList.add('fade');
@@ -99,6 +271,7 @@
             };
         }
 
+        loadSettings();
         connect();
     </script>
 </body>
