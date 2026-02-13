@@ -132,6 +132,17 @@ make -j$(sysctl -n hw.ncpu)
 
 `Ctrl+C`로 종료합니다.
 
+### 종료 코드 / 에러 처리
+
+- `-h`, `--help`는 도움말 출력 후 정상 종료 코드 `0`으로 종료합니다.
+- 수치 옵션(`--port`, `--step`, `--length`, `--keep`, `--threads`, `--capture`, `--vad-thold`)에 잘못된 값을 주면 에러 메시지를 출력하고 종료 코드 `1`로 종료합니다.
+
+### 설정 API (`/api/config`)
+
+- `POST /api/config` 요청 본문은 JSON 형식이며 `"target_lang"` 문자열 필드가 필요합니다.
+- 유효한 예시: `{"target_lang":"en"}` 또는 `{"target_lang":""}` (번역 끄기)
+- 잘못된 JSON(예: trailing garbage 포함) 또는 `"target_lang"` 누락/타입 오류는 `400`과 `{"ok":false,"error":"invalid target_lang"}`를 반환합니다.
+
 ## 프로젝트 구조
 
 ```
@@ -150,7 +161,7 @@ live-subtitle/
 
 1. SDL2로 마이크에서 오디오를 실시간 캡처
 2. 설정된 간격(`--step`)마다 오디오 데이터를 whisper.cpp에 전달
-3. 에너지 기반 VAD로 무음 구간은 건너뜀 (환각 방지)
+3. VAD로 무음 구간은 건너뜀 (`--step`이 1초 미만이면 에너지 체크로 대체)
 4. 동일 텍스트 3회 이상 반복 시 출력 생략 (환각 방지)
 5. 인식 결과를 SSE(Server-Sent Events)로 연결된 브라우저에 실시간 전송
 6. 브라우저에서 자막 스타일로 텍스트 표시, 5초간 입력 없으면 페이드 처리

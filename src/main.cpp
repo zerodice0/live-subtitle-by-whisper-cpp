@@ -10,11 +10,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cctype>
+#include <cstdint>
 #include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -248,6 +253,256 @@ static std::string json_bool(const char * key, bool value) {
     return std::string("\"") + key + "\":" + (value ? "true" : "false");
 }
 
+static void json_skip_ws(const std::string & s, size_t & pos) {
+    while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) {
+        ++pos;
+    }
+}
+
+static int hex_to_int(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void append_utf8(std::string & out, uint32_t cp) {
+    if (cp <= 0x7F) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+static bool parse_hex4(const std::string & s, size_t & pos, uint16_t & out) {
+    if (pos + 4 > s.size()) return false;
+    uint16_t val = 0;
+    for (int i = 0; i < 4; ++i) {
+        int x = hex_to_int(s[pos + i]);
+        if (x < 0) return false;
+        val = static_cast<uint16_t>((val << 4) | x);
+    }
+    pos += 4;
+    out = val;
+    return true;
+}
+
+static bool parse_json_string_token(const std::string & s, size_t & pos, std::string & out) {
+    if (pos >= s.size() || s[pos] != '"') return false;
+
+    ++pos;
+    out.clear();
+
+    while (pos < s.size()) {
+        const char c = s[pos++];
+        if (c == '"') {
+            return true;
+        }
+        if (static_cast<unsigned char>(c) < 0x20) {
+            return false;
+        }
+        if (c != '\\') {
+            out.push_back(c);
+            continue;
+        }
+
+        if (pos >= s.size()) return false;
+        const char esc = s[pos++];
+        switch (esc) {
+            case '"':  out.push_back('"');  break;
+            case '\\': out.push_back('\\'); break;
+            case '/':  out.push_back('/');  break;
+            case 'b':  out.push_back('\b'); break;
+            case 'f':  out.push_back('\f'); break;
+            case 'n':  out.push_back('\n'); break;
+            case 'r':  out.push_back('\r'); break;
+            case 't':  out.push_back('\t'); break;
+            case 'u': {
+                uint16_t cu1 = 0;
+                if (!parse_hex4(s, pos, cu1)) return false;
+
+                uint32_t cp = cu1;
+                if (cu1 >= 0xD800 && cu1 <= 0xDBFF) {
+                    if (pos + 2 > s.size() || s[pos] != '\\' || s[pos + 1] != 'u') {
+                        return false;
+                    }
+                    pos += 2;
+                    uint16_t cu2 = 0;
+                    if (!parse_hex4(s, pos, cu2) || cu2 < 0xDC00 || cu2 > 0xDFFF) {
+                        return false;
+                    }
+                    cp = 0x10000 + (((uint32_t)cu1 - 0xD800) << 10) + ((uint32_t)cu2 - 0xDC00);
+                } else if (cu1 >= 0xDC00 && cu1 <= 0xDFFF) {
+                    return false;
+                }
+
+                append_utf8(out, cp);
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+
+    return false;
+}
+
+static bool json_skip_value(const std::string & s, size_t & pos);
+
+static bool json_skip_object(const std::string & s, size_t & pos) {
+    if (pos >= s.size() || s[pos] != '{') return false;
+    ++pos;
+    json_skip_ws(s, pos);
+
+    if (pos < s.size() && s[pos] == '}') {
+        ++pos;
+        return true;
+    }
+
+    while (pos < s.size()) {
+        std::string ignored_key;
+        if (!parse_json_string_token(s, pos, ignored_key)) return false;
+        json_skip_ws(s, pos);
+        if (pos >= s.size() || s[pos] != ':') return false;
+        ++pos;
+        if (!json_skip_value(s, pos)) return false;
+        json_skip_ws(s, pos);
+        if (pos >= s.size()) return false;
+        if (s[pos] == ',') {
+            ++pos;
+            json_skip_ws(s, pos);
+            continue;
+        }
+        if (s[pos] == '}') {
+            ++pos;
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
+static bool json_skip_array(const std::string & s, size_t & pos) {
+    if (pos >= s.size() || s[pos] != '[') return false;
+    ++pos;
+    json_skip_ws(s, pos);
+
+    if (pos < s.size() && s[pos] == ']') {
+        ++pos;
+        return true;
+    }
+
+    while (pos < s.size()) {
+        if (!json_skip_value(s, pos)) return false;
+        json_skip_ws(s, pos);
+        if (pos >= s.size()) return false;
+        if (s[pos] == ',') {
+            ++pos;
+            json_skip_ws(s, pos);
+            continue;
+        }
+        if (s[pos] == ']') {
+            ++pos;
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
+static bool json_skip_primitive(const std::string & s, size_t & pos) {
+    const size_t start = pos;
+    while (pos < s.size()) {
+        const char c = s[pos];
+        if (c == ',' || c == '}' || c == ']' || std::isspace(static_cast<unsigned char>(c))) {
+            break;
+        }
+        ++pos;
+    }
+    return pos > start;
+}
+
+static bool json_skip_value(const std::string & s, size_t & pos) {
+    json_skip_ws(s, pos);
+    if (pos >= s.size()) return false;
+
+    if (s[pos] == '"') {
+        std::string ignored;
+        return parse_json_string_token(s, pos, ignored);
+    }
+    if (s[pos] == '{') return json_skip_object(s, pos);
+    if (s[pos] == '[') return json_skip_array(s, pos);
+
+    return json_skip_primitive(s, pos);
+}
+
+static bool json_get_string_field(const std::string & s, const std::string & key, std::string & out) {
+    size_t pos = 0;
+    json_skip_ws(s, pos);
+    if (pos >= s.size() || s[pos] != '{') return false;
+    ++pos;
+    json_skip_ws(s, pos);
+
+    if (pos < s.size() && s[pos] == '}') return false;
+
+    bool found = false;
+    std::string found_value;
+
+    while (pos < s.size()) {
+        std::string name;
+        if (!parse_json_string_token(s, pos, name)) return false;
+        json_skip_ws(s, pos);
+        if (pos >= s.size() || s[pos] != ':') return false;
+        ++pos;
+        json_skip_ws(s, pos);
+
+        if (name == key) {
+            std::string value;
+            if (!parse_json_string_token(s, pos, value)) return false;
+            if (!found) {
+                found = true;
+                found_value = value;
+            }
+        } else {
+            if (!json_skip_value(s, pos)) return false;
+        }
+        json_skip_ws(s, pos);
+        if (pos >= s.size()) return false;
+
+        if (s[pos] == ',') {
+            ++pos;
+            json_skip_ws(s, pos);
+            continue;
+        }
+        if (s[pos] == '}') {
+            ++pos;
+            break;
+        }
+        return false;
+    }
+
+    if (!found) return false;
+
+    json_skip_ws(s, pos);
+    if (pos != s.size()) return false;
+
+    out = found_value;
+
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Translation via LibreTranslate
 // ---------------------------------------------------------------------------
@@ -265,27 +520,11 @@ static std::string translate_text(httplib::Client & client,
         return "";
     }
 
-    // Minimal JSON extraction for {"translatedText":"..."}
-    // Handles \" and \\ escapes (sufficient for LibreTranslate responses)
-    const std::string needle = "\"translatedText\":\"";
-    auto pos = res->body.find(needle);
-    if (pos == std::string::npos) {
+    std::string translated;
+    if (!json_get_string_field(res->body, "translatedText", translated)) {
         return "";
     }
-    pos += needle.size();
-
-    std::string result;
-    for (size_t i = pos; i < res->body.size(); i++) {
-        if (res->body[i] == '\\' && i + 1 < res->body.size()) {
-            result += res->body[i + 1];
-            i++;
-        } else if (res->body[i] == '"') {
-            break;
-        } else {
-            result += res->body[i];
-        }
-    }
-    return result;
+    return translated;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +547,7 @@ struct subtitle_state {
 // ---------------------------------------------------------------------------
 
 struct params {
-    int32_t n_threads  = std::min(4, (int32_t)std::thread::hardware_concurrency());
+    int32_t n_threads  = std::max(1, std::min(4, (int32_t)std::thread::hardware_concurrency()));
     int32_t step_ms    = 3000;
     int32_t length_ms  = 10000;
     int32_t keep_ms    = 200;
@@ -326,6 +565,7 @@ struct params {
 };
 
 static void print_usage(const char * prog) {
+    const int default_threads = std::max(1, std::min(4, (int)std::thread::hardware_concurrency()));
     fprintf(stderr, "\nUsage: %s [options]\n\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --model PATH       Whisper model path      (default: models/ggml-large-v3-turbo.bin)\n");
@@ -334,7 +574,7 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  --length N         Audio length in ms      (default: 10000)\n");
     fprintf(stderr, "  --keep N           Audio keep in ms        (default: 200)\n");
     fprintf(stderr, "  --threads N        Inference threads       (default: %d)\n",
-            std::min(4, (int)std::thread::hardware_concurrency()));
+            default_threads);
     fprintf(stderr, "  --capture N        Audio device ID         (default: -1 = auto)\n");
     fprintf(stderr, "  --language LANG    Language or 'auto'      (default: auto)\n");
     fprintf(stderr, "  --vad-thold F      VAD energy threshold    (default: 0.6)\n");
@@ -344,29 +584,140 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  -h, --help         Show this help\n\n");
 }
 
-static bool parse_params(int argc, char ** argv, params & p) {
+enum class parse_result {
+    ok = 0,
+    help,
+    error,
+};
+
+static bool parse_int_arg(const char * name, const char * raw,
+                          int32_t & out, int32_t min_v, int32_t max_v) {
+    char * end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0' ||
+        parsed < min_v || parsed > max_v) {
+        fprintf(stderr, "error: invalid value for %s: '%s' (expected %d..%d)\n",
+                name, raw, min_v, max_v);
+        return false;
+    }
+
+    out = static_cast<int32_t>(parsed);
+    return true;
+}
+
+static bool parse_float_arg(const char * name, const char * raw,
+                            float & out, float min_v, float max_v) {
+    char * end = nullptr;
+    errno = 0;
+    const float parsed = std::strtof(raw, &end);
+    if (errno != 0 || end == raw || *end != '\0' || !std::isfinite(parsed) ||
+        parsed < min_v || parsed > max_v) {
+        fprintf(stderr, "error: invalid value for %s: '%s' (expected %.2f..%.2f)\n",
+                name, raw, min_v, max_v);
+        return false;
+    }
+
+    out = parsed;
+    return true;
+}
+
+static bool take_option_value(int argc, char ** argv, int & i, const char * opt, const char * & out) {
+    if (i + 1 >= argc) {
+        fprintf(stderr, "error: missing value for %s\n", opt);
+        return false;
+    }
+
+    out = argv[++i];
+    return true;
+}
+
+static bool has_non_silent_energy(const std::vector<float> & samples) {
+    if (samples.empty()) {
+        return false;
+    }
+
+    constexpr float silence_threshold = 0.0001f;
+
+    float energy = 0.0f;
+    for (float sample : samples) {
+        energy += fabsf(sample);
+    }
+    energy /= samples.size();
+
+    return energy >= silence_threshold;
+}
+
+static bool should_process_audio_chunk(const std::vector<float> & samples, float vad_thold) {
+    constexpr int vad_last_ms = 1000;
+    const int vad_min_samples = (WHISPER_SAMPLE_RATE * vad_last_ms) / 1000;
+
+    if ((int)samples.size() < vad_min_samples) {
+        return has_non_silent_energy(samples);
+    }
+
+    std::vector<float> vad_audio = samples;
+    return ::vad_simple(vad_audio, WHISPER_SAMPLE_RATE, vad_last_ms,
+                        vad_thold, 100.0f, false);
+}
+
+static parse_result parse_params(int argc, char ** argv, params & p) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if      (arg == "--model"     && i+1 < argc) { p.model      = argv[++i]; }
-        else if (arg == "--port"      && i+1 < argc) { p.port       = std::stoi(argv[++i]); }
-        else if (arg == "--step"      && i+1 < argc) { p.step_ms    = std::stoi(argv[++i]); }
-        else if (arg == "--length"    && i+1 < argc) { p.length_ms  = std::stoi(argv[++i]); }
-        else if (arg == "--keep"      && i+1 < argc) { p.keep_ms    = std::stoi(argv[++i]); }
-        else if (arg == "--threads"   && i+1 < argc) { p.n_threads  = std::stoi(argv[++i]); }
-        else if (arg == "--capture"   && i+1 < argc) { p.capture_id = std::stoi(argv[++i]); }
-        else if (arg == "--language"  && i+1 < argc) { p.language   = argv[++i]; }
-        else if (arg == "--vad-thold" && i+1 < argc) { p.vad_thold  = std::stof(argv[++i]); }
-        else if (arg == "--translate-url" && i+1 < argc) { p.translate_url = argv[++i]; }
+        const char * raw = nullptr;
+
+        if      (arg == "--model") {
+            if (!take_option_value(argc, argv, i, "--model", raw)) return parse_result::error;
+            p.model = raw;
+        }
+        else if (arg == "--port") {
+            if (!take_option_value(argc, argv, i, "--port", raw)) return parse_result::error;
+            if (!parse_int_arg("--port", raw, p.port, 1, 65535)) return parse_result::error;
+        }
+        else if (arg == "--step") {
+            if (!take_option_value(argc, argv, i, "--step", raw)) return parse_result::error;
+            if (!parse_int_arg("--step", raw, p.step_ms, 1, 3600000)) return parse_result::error;
+        }
+        else if (arg == "--length") {
+            if (!take_option_value(argc, argv, i, "--length", raw)) return parse_result::error;
+            if (!parse_int_arg("--length", raw, p.length_ms, 1, 3600000)) return parse_result::error;
+        }
+        else if (arg == "--keep") {
+            if (!take_option_value(argc, argv, i, "--keep", raw)) return parse_result::error;
+            if (!parse_int_arg("--keep", raw, p.keep_ms, 0, 3600000)) return parse_result::error;
+        }
+        else if (arg == "--threads") {
+            if (!take_option_value(argc, argv, i, "--threads", raw)) return parse_result::error;
+            if (!parse_int_arg("--threads", raw, p.n_threads, 1, 4096)) return parse_result::error;
+        }
+        else if (arg == "--capture") {
+            if (!take_option_value(argc, argv, i, "--capture", raw)) return parse_result::error;
+            if (!parse_int_arg("--capture", raw, p.capture_id, -1, std::numeric_limits<int32_t>::max())) {
+                return parse_result::error;
+            }
+        }
+        else if (arg == "--language") {
+            if (!take_option_value(argc, argv, i, "--language", raw)) return parse_result::error;
+            p.language = raw;
+        }
+        else if (arg == "--vad-thold") {
+            if (!take_option_value(argc, argv, i, "--vad-thold", raw)) return parse_result::error;
+            if (!parse_float_arg("--vad-thold", raw, p.vad_thold, 0.0f, 10.0f)) return parse_result::error;
+        }
+        else if (arg == "--translate-url") {
+            if (!take_option_value(argc, argv, i, "--translate-url", raw)) return parse_result::error;
+            p.translate_url = raw;
+        }
         else if (arg == "--no-gpu")         { p.use_gpu    = false; }
         else if (arg == "--no-flash-attn")  { p.flash_attn = false; }
-        else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return false; }
+        else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return parse_result::help; }
         else {
-            fprintf(stderr, "Unknown option: %s\n", arg.c_str());
+            fprintf(stderr, "error: unknown option: %s\n", arg.c_str());
             print_usage(argv[0]);
-            return false;
+            return parse_result::error;
         }
     }
-    return true;
+    return parse_result::ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +738,11 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
     params par;
-    if (!parse_params(argc, argv, par)) {
+    const parse_result parsed = parse_params(argc, argv, par);
+    if (parsed == parse_result::help) {
+        return 0;
+    }
+    if (parsed == parse_result::error) {
         return 1;
     }
 
@@ -453,26 +808,37 @@ int main(int argc, char ** argv) {
 
         res.set_chunked_content_provider("text/event-stream",
             [&state, client_version](size_t /*offset*/, httplib::DataSink & sink) mutable {
-                std::unique_lock<std::mutex> lock(state.mtx);
+                std::string event;
+                uint64_t next_version = client_version;
+                bool running = true;
 
-                state.cv.wait_for(lock, std::chrono::seconds(15), [&] {
-                    return state.version > client_version || !state.running;
-                });
+                {
+                    std::unique_lock<std::mutex> lock(state.mtx);
 
-                if (!state.running) {
+                    state.cv.wait_for(lock, std::chrono::seconds(15), [&] {
+                        return state.version > client_version || !state.running;
+                    });
+
+                    running = state.running;
+                    if (running && state.version > client_version) {
+                        next_version = state.version;
+                        std::string json = "{" + json_str("text", state.text) +
+                                           "," + json_str("translated", state.translated) +
+                                           "," + json_str("language", state.language) + "}";
+                        event = "data: " + json + "\n\n";
+                    }
+                }
+
+                if (!running) {
                     sink.done();
                     return false;
                 }
 
-                if (state.version > client_version) {
-                    client_version = state.version;
-                    std::string json = "{" + json_str("text", state.text) +
-                                       "," + json_str("translated", state.translated) +
-                                       "," + json_str("language", state.language) + "}";
-                    std::string event = "data: " + json + "\n\n";
+                if (!event.empty()) {
                     if (!sink.write(event.c_str(), event.size())) {
                         return false;
                     }
+                    client_version = next_version;
                 } else {
                     // SSE keepalive comment
                     if (!sink.write(": keepalive\n\n", 13)) {
@@ -513,16 +879,13 @@ int main(int argc, char ** argv) {
 
     svr.Post("/api/config", [&state](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        const std::string needle = "\"target_lang\":\"";
-        auto pos = req.body.find(needle);
         std::string lang;
-        if (pos != std::string::npos) {
-            pos += needle.size();
-            auto end = req.body.find('"', pos);
-            if (end != std::string::npos) {
-                lang = req.body.substr(pos, end - pos);
-            }
+        if (!json_get_string_field(req.body, "target_lang", lang)) {
+            res.status = 400;
+            res.set_content("{\"ok\":false,\"error\":\"invalid target_lang\"}", "application/json");
+            return;
         }
+
         {
             std::lock_guard<std::mutex> lock(state.mtx);
             state.target_lang = lang;
@@ -586,17 +949,9 @@ int main(int argc, char ** argv) {
 
         const int n_samples_new = (int)pcmf32_new.size();
 
-        // Energy-based VAD — skip silent audio to prevent hallucination
-        {
-            constexpr float silence_threshold = 0.0001f;
-            float energy = 0.0f;
-            for (float sample : pcmf32_new) {
-                energy += fabsf(sample);
-            }
-            energy /= n_samples_new;
-            if (energy < silence_threshold) {
-                continue;
-            }
+        // VAD-based silence check.
+        if (!should_process_audio_chunk(pcmf32_new, par.vad_thold)) {
+            continue;
         }
 
         // Combine previous (keep) + new audio

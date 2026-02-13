@@ -6,3 +6,8 @@ build/
 
 # macOS metadata
 .DS_Store
+
+# Local agent/tool artifacts
+.serena/
+mcp_audit.db
+mcp_security.log
